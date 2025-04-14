@@ -1,0 +1,187 @@
+import os
+print(os.listdir())  # Lists all files in the current directory
+from google.colab import drive
+drive.mount('/content/drive')
+import firebase_admin
+from firebase_admin import credentials, firestore
+import cv2
+import torch
+import numpy as np
+from collections import Counter
+from tensorflow.keras.models import load_model
+from tensorflow.keras.preprocessing import image
+from google.colab.patches import cv2_imshow
+import os
+
+# Force TensorFlow to use CPU
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+
+# Initialize Firebase
+if not firebase_admin._apps:
+    cred = credentials.Certificate("/content/drive/MyDrive/firebase_credentials.json")
+    firebase_admin.initialize_app(cred)
+
+db = firestore.client()
+
+# Load YOLOv5 model
+yolo_model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True, force_reload=True)
+
+# Load the insect classification model
+model = load_model('/content/drive/MyDrive/Models/best_model.keras')
+
+# Define class names and harmful/non-harmful categorization
+class_names = {
+    0: 'aphids', 1: 'beetle', 2: 'blackbug', 3: 'bollworm', 4: 'brownplanthopper',
+    5: 'butterfly', 6: 'grasshopper', 7: 'mosquito', 8: 'rice leaf catepillar',
+    9: 'rice leaf roller', 10: 'stem borer'
+}
+
+insect_categories = {
+    'aphids': 'harmful', 'beetle': 'non-harmful', 'blackbug': 'harmful',
+    'bollworm': 'harmful', 'brownplanthopper': 'harmful',
+    'butterfly': 'non-harmful', 'grasshopper': 'non-harmful',
+    'mosquito': 'non-harmful', 'rice leaf catepillar': 'harmful',
+    'rice leaf roller': 'harmful', 'stem borer': 'harmful'
+}
+
+def load_and_preprocess_image(image_path):
+    """Loads and preprocesses the input image."""
+    img = cv2.imread(image_path)
+    if img is None:
+        raise ValueError("Error loading image. Check the file path.")
+    return img
+
+def detect_insects(image):
+    """Runs YOLOv5 model for insect detection."""
+    results = yolo_model(image)
+    return results.pandas().xyxy[0]  # Get bounding box coordinates
+
+def classify_insect(cropped_image):
+    """Classifies an insect using the trained model."""
+    insect_img = cv2.resize(cropped_image, (224, 224))
+    insect_img = image.img_to_array(insect_img) / 255.0
+    insect_img = np.expand_dims(insect_img, axis=0)
+    predictions = model.predict(insect_img)
+    predicted_class = np.argmax(predictions)
+    return class_names.get(predicted_class, "unknown")
+
+def annotate_image(image, detections):
+    """Annotates image with bounding boxes and classifications."""
+    labels = []
+    harmful_list = []
+    non_harmful_list = []
+
+    for _, row in detections.iterrows():
+        x1, y1, x2, y2 = map(int, [row['xmin'], row['ymin'], row['xmax'], row['ymax']])
+        cropped_insect = image[y1:y2, x1:x2]
+
+        if cropped_insect.size == 0:
+            continue
+
+        predicted_class_name = classify_insect(cropped_insect)
+        category = insect_categories.get(predicted_class_name, "unknown")
+        labels.append((predicted_class_name, category))
+
+        if category == "harmful":
+            harmful_list.append(predicted_class_name)
+            color = (0, 0, 255)  # Red for harmful insects
+        else:
+            non_harmful_list.append(predicted_class_name)
+            color = (0, 255, 0)  # Green for non-harmful insects
+
+        label_text = f"{predicted_class_name} ({category})"
+        cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(image, label_text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+
+    return labels, harmful_list, non_harmful_list, image
+
+def upload_to_firestore(insect_count, harmful_count, non_harmful_count, harmful_list, non_harmful_list):
+    """Uploads insect counts and details to Firebase Firestore."""
+    data = {
+        "total_insects": sum(insect_count.values()),
+        "insect_count": dict(insect_count),
+        "harmful_count": harmful_count,
+        "non_harmful_count": non_harmful_count,
+        "harmful_insects": harmful_list,
+        "non_harmful_insects": non_harmful_list
+    }
+    doc_ref = db.collection("insect_detections").document()
+    doc_ref.set(data)
+    print("✅ Insect counts and classification uploaded to Firestore successfully!")
+
+def main(image_path):
+    img = load_and_preprocess_image(image_path)
+    detections = detect_insects(img)
+    labels, harmful_list, non_harmful_list, annotated_img = annotate_image(img, detections)
+
+    # Count insect occurrences
+    insect_count = Counter(label[0] for label in labels)
+    harmful_count = len(harmful_list)
+    non_harmful_count = len(non_harmful_list)
+
+    print("\n📊 Detection Summary:")
+    print(f"Total Insects Detected: {sum(insect_count.values())}")
+    print(f"Harmful Insects ({harmful_count}): {harmful_list}")
+    print(f"Non-Harmful Insects ({non_harmful_count}): {non_harmful_list}")
+
+    # Save the annotated image
+    cv2.imwrite('annotated_image.jpg', annotated_img)
+    cv2_imshow(annotated_img)
+
+    # Upload results to Firebase
+    upload_to_firestore(insect_count, harmful_count, non_harmful_count, harmful_list, non_harmful_list)
+
+if __name__ == "__main__":
+    image_path = '/content/drive/MyDrive/test1.jpg'
+    main(image_path)
+import os
+import numpy as np
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.models import load_model
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Load the trained model
+model = load_model('/content/drive/MyDrive/Models/best_model.keras')
+
+# Set test dataset directory
+test_dir = '/content/drive/MyDrive/test'
+
+# Prepare the test data generator
+test_datagen = ImageDataGenerator(rescale=1./255)
+
+test_generator = test_datagen.flow_from_directory(
+    test_dir,
+    target_size=(224, 224),
+    batch_size=32,
+    class_mode='categorical',
+    shuffle=False
+)
+
+# Predict classes
+Y_pred = model.predict(test_generator)
+y_pred = np.argmax(Y_pred, axis=1)
+
+# True labels
+y_true = test_generator.classes
+
+# Accuracy
+acc = accuracy_score(y_true, y_pred)
+print(f"✅ Test Accuracy: {acc:.2f}")
+
+# Classification report
+class_labels = list(test_generator.class_indices.keys())
+print("\n📊 Classification Report:")
+print(classification_report(y_true, y_pred, target_names=class_labels))
+
+# Confusion Matrix
+cm = confusion_matrix(y_true, y_pred)
+
+# Plot confusion matrix
+plt.figure(figsize=(10, 8))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=class_labels, yticklabels=class_labels)
+plt.xlabel('Predicted')
+plt.ylabel('Actual')
+plt.title('Confusion Matrix')
+plt.show()
