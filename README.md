@@ -1,1 +1,1 @@
-# Inset-trap
+# Insect-trap
